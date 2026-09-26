@@ -23,6 +23,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--full-prompt", action="store_true", help="steer the prompt too (cvec_decode_only = false), like the HF hook")
     ap.add_argument("--parallel", type=int, default=4)
+    ap.add_argument("--doses", type=float, nargs="+", default=emo_steer.DOSES)
     args = ap.parse_args()
 
     tok, model = emo_steer.load()
@@ -44,7 +45,7 @@ def main():
         r.raise_for_status()
         return {"dose": dose, "prompt": prompt, "sample": s, "text": r.json()["content"]}
 
-    jobs = [(d, pi, s) for d in emo_steer.DOSES for pi in range(len(emo_steer.PROMPTS)) for s in range(emo_steer.N_SAMPLES)]
+    jobs = [(d, pi, s) for d in args.doses for pi in range(len(emo_steer.PROMPTS)) for s in range(emo_steer.N_SAMPLES)]
     with ThreadPoolExecutor(args.parallel) as ex:
         gens = list(ex.map(gen, jobs))
 
