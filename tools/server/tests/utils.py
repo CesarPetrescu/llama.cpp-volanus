@@ -97,6 +97,7 @@ class ServerProcess:
     lora_files: List[str] | None = None
     cvec_dir: str | None = None
     cvec_max_scale: float | None = None
+    cvec_max_total_dose: float | None = None
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
     spec_draft_n_min: int | None = None
@@ -242,6 +243,8 @@ class ServerProcess:
             server_args.extend(["--cvec-dir", self.cvec_dir])
         if self.cvec_max_scale is not None:
             server_args.extend(["--cvec-max-scale", self.cvec_max_scale])
+        if self.cvec_max_total_dose is not None:
+            server_args.extend(["--cvec-max-total-dose", self.cvec_max_total_dose])
         if self.enable_ctx_shift:
             server_args.append("--context-shift")
         if self.spec_type:

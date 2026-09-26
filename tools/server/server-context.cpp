@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -867,8 +868,9 @@ public:
     // note: only written by the first load_model(), read-only after that
     struct server_cvec {
         int n_embd;
-        std::vector<float> data; // n_embd x n_layer, layer 1 at [0]
+        std::vector<float> data;  // n_embd x n_layer, layer 1 at [0]
         std::vector<int>   layers;
+        std::vector<float> hnorm; // per layer, from controlvector.hnorm.<il>, 0 = unknown
     };
     std::map<std::string, server_cvec> cvecs;
 
@@ -917,7 +919,8 @@ private:
 
     common_speculative_ptr spec;
 
-    std::vector<float> cvec_base; // global --control-vector data, zero outside its layer range
+    std::vector<float> cvec_base;  // global --control-vector data, zero outside its layer range
+    std::vector<float> cvec_hnorm; // per layer, reference hidden-state norm for --cvec-max-total-dose
     std::vector<float> cvec_buf;
     std::map<std::string, float> cvec_applied; // request vectors currently set on ctx_tgt
 
@@ -1721,16 +1724,65 @@ private:
         return res;
     }
 
+    // median hidden-state norm per layer, as written by the vector's author
+    static std::vector<float> cvec_read_hnorm(const std::string & fname, int n_layer) {
+        std::vector<float> res(n_layer, 0.0f);
+        gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        gguf_context * ctx = gguf_init_from_file(fname.c_str(), params);
+        if (ctx == nullptr) {
+            return res;
+        }
+        for (int il = 1; il < n_layer; il++) {
+            const int64_t key = gguf_find_key(ctx, ("controlvector.hnorm." + std::to_string(il)).c_str());
+            if (key >= 0 && gguf_get_kv_type(ctx, key) == GGUF_TYPE_FLOAT32) {
+                res[il] = gguf_get_val_f32(ctx, key);
+            }
+        }
+        gguf_free(ctx);
+        return res;
+    }
+
     bool load_cvecs() {
         // a new context has only the global vector set
         cvec_applied.clear();
 
-        if (params_base.cvec_dir.empty() || !cvecs.empty()) {
+        if (params_base.cvec_dir.empty()) {
+            if (params_base.cvec_max_total_dose > 0.0f) {
+                SRV_ERR("%s", "--cvec-max-total-dose needs --cvec-dir\n");
+                return false;
+            }
             return true;
         }
 
+        if (cvecs.empty() && !load_cvec_dir()) {
+            return false;
+        }
+
+        // the global vector was set by common_init_from_params, before the dose cap
+        if (params_base.cvec_max_total_dose > 0.0f && !params_base.control_vectors.empty()) {
+            return apply_cvec({}, true);
+        }
+
+        return true;
+    }
+
+    bool load_cvec_dir() {
         const int n_embd  = llama_model_n_embd(model_tgt);
         const int n_layer = llama_model_n_layer(model_tgt);
+
+        cvec_hnorm.assign(n_layer, 0.0f);
+        auto add_hnorm = [&](const std::vector<float> & hnorm, const std::string & fname) {
+            for (int il = 1; il < n_layer; il++) {
+                if (hnorm[il] <= 0.0f) {
+                    continue;
+                }
+                if (cvec_hnorm[il] <= 0.0f) {
+                    cvec_hnorm[il] = hnorm[il];
+                } else if (std::fabs(hnorm[il] - cvec_hnorm[il]) > 0.1f * cvec_hnorm[il]) {
+                    SRV_WRN("control vector '%s' has hnorm %.3f for layer %d, using %.3f from another file\n", fname.c_str(), hnorm[il], il, cvec_hnorm[il]);
+                }
+            }
+        };
 
         std::error_code ec;
         for (const auto & entry : std::filesystem::directory_iterator(params_base.cvec_dir, ec)) {
@@ -1750,6 +1802,7 @@ private:
 
             server_cvec cur;
             cur.n_embd = n_embd;
+            cur.hnorm  = cvec_read_hnorm(fname, n_layer);
             cur.data   = cvec.data;
             cur.data.resize((size_t) n_embd * n_layer, 0.0f);
             for (int il = 1; il < n_layer; il++) {
@@ -1758,6 +1811,7 @@ private:
                     cur.layers.push_back(il);
                 }
             }
+            add_hnorm(cur.hnorm, fname);
             cvecs[entry.path().stem().string()] = std::move(cur);
         }
         if (ec) {
@@ -1778,6 +1832,23 @@ private:
                     std::copy_n(base.data.begin() + off, n_embd, cvec_base.begin() + off);
                 }
             }
+            for (const auto & info : params_base.control_vectors) {
+                add_hnorm(cvec_read_hnorm(info.fname, n_layer), info.fname);
+            }
+        }
+
+        if (params_base.cvec_max_total_dose > 0.0f) {
+            for (int il = 1; il < n_layer; il++) {
+                const auto it = cvec_base.begin() + (size_t) n_embd * (il - 1);
+                bool used = std::any_of(it, it + n_embd, [](float x) { return x != 0.0f; });
+                for (const auto & [id, cur] : cvecs) {
+                    used |= std::find(cur.layers.begin(), cur.layers.end(), il) != cur.layers.end();
+                }
+                if (used && cvec_hnorm[il] <= 0.0f) {
+                    SRV_ERR("--cvec-max-total-dose needs controlvector.hnorm.%d in the control vectors that use layer %d\n", il, il);
+                    return false;
+                }
+            }
         }
 
         SRV_INF("loaded %zu control vectors from '%s'\n", cvecs.size(), params_base.cvec_dir.c_str());
@@ -1786,8 +1857,8 @@ private:
     }
 
     // set global + request control vectors on ctx_tgt, only if they differ from the current ones
-    bool apply_cvec(const std::map<std::string, float> & cvec) {
-        if (cvec == cvec_applied) {
+    bool apply_cvec(const std::map<std::string, float> & cvec, bool force = false) {
+        if (cvec == cvec_applied && !force) {
             return true;
         }
 
@@ -1806,6 +1877,24 @@ private:
                     cvec_buf[i] += scale * cur.data[i];
                 }
                 desc += string_format("%s%s x %.3f (layers %s)", desc.empty() ? "" : ", ", id.c_str(), scale, string_from(cur.layers).c_str());
+            }
+            if (params_base.cvec_max_total_dose > 0.0f) {
+                for (int il = 1; il < n_layer; il++) {
+                    float * v = cvec_buf.data() + (size_t) n_embd * (il - 1);
+                    double sum = 0.0;
+                    for (int j = 0; j < n_embd; j++) {
+                        sum += (double) v[j] * v[j];
+                    }
+                    const double norm     = std::sqrt(sum);
+                    const double norm_max = (double) params_base.cvec_max_total_dose * cvec_hnorm[il];
+                    if (norm > norm_max) {
+                        const float s = (float) (norm_max / norm);
+                        for (int j = 0; j < n_embd; j++) {
+                            v[j] *= s;
+                        }
+                        desc += string_format(", layer %d rescaled x %.3f", il, s);
+                    }
+                }
             }
             err = llama_set_adapter_cvec(ctx_tgt, cvec_buf.data(), cvec_buf.size(), n_embd, 1, n_layer);
         }
@@ -5397,11 +5486,22 @@ void server_routes::init_routes() {
         auto res = create_response();
         json result = json::array();
         for (const auto & [id, cvec] : ctx_server.cvecs) {
-            result.push_back({
+            json entry = {
                 {"id",     id},
                 {"layers", cvec.layers},
                 {"n_embd", cvec.n_embd},
-            });
+            };
+            // hidden-state norm at each of the vector's layers, when the file has controlvector.hnorm.<il>
+            json hnorm = json::array();
+            for (int il : cvec.layers) {
+                if (cvec.hnorm[il] > 0.0f) {
+                    hnorm.push_back(cvec.hnorm[il]);
+                }
+            }
+            if (!cvec.layers.empty() && hnorm.size() == cvec.layers.size()) {
+                entry["hnorm"] = hnorm;
+            }
+            result.push_back(entry);
         }
         res->ok(result);
         return res;

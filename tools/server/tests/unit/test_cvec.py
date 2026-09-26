@@ -17,10 +17,15 @@ N_PREDICT = 32
 DOSES = [-1.2, -0.8, -0.4, 0.0, 0.4, 0.8, 1.2]
 
 
-def write_cvec(path: Path, layer: int, vec: np.ndarray):
-    # minimal GGUF v3 file with one F32 tensor "direction.<layer>", as read by common_control_vector_load
+def write_cvec(path: Path, layer: int, vec: np.ndarray, hnorm: dict[int, float] | None = None):
+    # minimal GGUF v3 file with one F32 tensor "direction.<layer>", as read by common_control_vector_load,
+    # plus optional F32 metadata "controlvector.hnorm.<il>"
+    kv = b""
+    for il, h in (hnorm or {}).items():
+        key = f"controlvector.hnorm.{il}".encode()
+        kv += struct.pack("<Q", len(key)) + key + struct.pack("<If", 6, h)  # 6 = GGUF_TYPE_FLOAT32
     name = f"direction.{layer}".encode()
-    data = b"GGUF" + struct.pack("<IQQ", 3, 1, 0)
+    data = b"GGUF" + struct.pack("<IQQ", 3, 1, len(hnorm or {})) + kv
     data += struct.pack("<Q", len(name)) + name + struct.pack("<IQIQ", 1, len(vec), 0, 0)
     data += b"\0" * (-len(data) % 32)
     data += np.asarray(vec, dtype="<f4").tobytes()
@@ -194,5 +199,64 @@ def test_cvec_without_dir():
 def test_cvec_refuse_start(n_embd, tmp_path, delta_n_embd, layer):
     write_cvec(tmp_path / "bad.gguf", layer, np.ones(n_embd + delta_n_embd))
     server = make_server(str(tmp_path))
+    with pytest.raises(RuntimeError):
+        server.start()
+
+
+def tokens(server: ServerProcess, cvec: list[dict]) -> list[int]:
+    res = server.make_request("POST", "/completion", data={
+        "prompt": PROMPT, "n_predict": N_PREDICT, "temperature": 0.0, "cache_prompt": False, "return_tokens": True, "cvec": cvec,
+    })
+    assert res.status_code == 200, res.body
+    return res.body["tokens"]
+
+
+@pytest.fixture(scope="module")
+def dose_dir(n_embd, tmp_path_factory) -> str:
+    # two orthogonal vectors at layer 1, each as long as the layer's (declared) hidden-state norm
+    d = tmp_path_factory.mktemp("cvec_dose")
+    q, _ = np.linalg.qr(np.random.default_rng(1).standard_normal((n_embd, 2)))
+    for name, v in zip(["a", "b"], q.T):
+        write_cvec(d / f"{name}.gguf", 1, 5.0 * v, {1: 5.0})
+    return str(d)
+
+
+def test_cvec_hnorm_metadata(n_embd, tmp_path):
+    v = np.random.default_rng(2).standard_normal(n_embd)
+    write_cvec(tmp_path / "with.gguf", 1, v, {1: 12.5})
+    write_cvec(tmp_path / "without.gguf", 1, v)
+    server = make_server(str(tmp_path))
+    server.start()
+    res = server.make_request("GET", "/cvecs")
+    assert res.status_code == 200
+    by_id = {e["id"]: e for e in res.body}
+    assert by_id["with"]["hnorm"] == [12.5]
+    assert "hnorm" not in by_id["without"]
+
+
+@pytest.mark.parametrize("max_total_dose", [None, 1.0])
+def test_cvec_max_total_dose(dose_dir, max_total_dose):
+    server = make_server(dose_dir)
+    server.cvec_max_total_dose = max_total_dose
+    server.start()
+    a1    = tokens(server, [{"id": "a", "scale": 1.0}])
+    a2    = tokens(server, [{"id": "a", "scale": 2.0}])
+    a05   = tokens(server, [{"id": "a", "scale": 0.5}])
+    ab    = tokens(server, [{"id": "a", "scale": 1.0}, {"id": "b", "scale": 1.0}])
+    ab_n  = tokens(server, [{"id": "a", "scale": 0.5 ** 0.5}, {"id": "b", "scale": 0.5 ** 0.5}])
+    assert a05 != a1  # below the cap nothing changes
+    if max_total_dose is None:
+        assert a2 != a1
+        assert ab != ab_n
+    else:
+        # ||2a|| = 2 hnorm -> rescaled to 1 hnorm; ||a + b|| = 1.41 hnorm -> rescaled like (a + b) / sqrt(2)
+        assert a2 == a1
+        assert ab == ab_n
+
+
+def test_cvec_max_total_dose_needs_hnorm(n_embd, tmp_path):
+    write_cvec(tmp_path / "a.gguf", 1, np.ones(n_embd))
+    server = make_server(str(tmp_path))
+    server.cvec_max_total_dose = 1.0
     with pytest.raises(RuntimeError):
         server.start()

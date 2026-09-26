@@ -3810,6 +3810,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cvec-max-total-dose"}, "X",
+        "rescale the summed control vector of a layer when its norm exceeds X times the layer's hidden-state norm (controlvector.hnorm.<il> in the vector files; default: 0 = off)",
+        [](common_params & params, const std::string & value) {
+            params.cvec_max_total_dose = std::stof(value);
+            if (!(params.cvec_max_total_dose >= 0.0f)) {
+                throw std::invalid_argument("--cvec-max-total-dose must be >= 0");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {

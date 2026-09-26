@@ -19,12 +19,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
 import gguf  # noqa: E402
 
 
-def write_cvec(path: Path, layer: int, vec: np.ndarray, model_hint: str):
+def write_cvec(path: Path, layer: int, vec: np.ndarray, model_hint: str, hnorm=None):
+    # hnorm: median hidden-state norm per layer (index = layer), stored as controlvector.hnorm.<il> for --cvec-max-total-dose
     if layer < 1:
         raise ValueError("llama.cpp cannot steer layer 0")
     w = gguf.GGUFWriter(str(path), "controlvector")
     w.add_string("controlvector.model_hint", model_hint)
     w.add_int32("controlvector.layer_count", 1)
+    for il, h in enumerate(hnorm if hnorm is not None else []):
+        if il >= 1 and h > 0:
+            w.add_float32(f"controlvector.hnorm.{il}", float(h))
     w.add_tensor(f"direction.{layer}", vec.astype(np.float32))
     w.write_header_to_file()
     w.write_kv_data_to_file()
@@ -41,6 +45,18 @@ def measure_hnorm(model_dir: str) -> list[float]:
     tok = AutoTokenizer.from_pretrained(model_dir)
     model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16)
     model.eval()
+    inner = model.model
+    layers = inner.language_model.layers if hasattr(inner, "language_model") else inner.layers
+    outs = [None] * len(layers)
+
+    # hook the layer outputs: hidden_states[-1] from HF is after the final norm
+    def hook(il):
+        def fn(mod, inp, out):
+            outs[il] = out[0] if isinstance(out, tuple) else out
+        return fn
+
+    for il, layer in enumerate(layers):
+        layer.register_forward_hook(hook(il))
     prompts = [
         "Describe the weather today in two sentences.",
         "What is a good way to spend a quiet afternoon?",
@@ -52,9 +68,9 @@ def measure_hnorm(model_dir: str) -> list[float]:
         text = tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
         ids = tok(text, return_tensors="pt").input_ids
         with torch.no_grad():
-            hs = model(ids, output_hidden_states=True).hidden_states
-        # hidden_states[L + 1] is the output of layer L; skip token 0 (attention sink with outlier norm)
-        cur = [h[0, 1:].float().norm(dim=-1) for h in hs[1:]]
+            model(ids)
+        # skip token 0 (attention sink with outlier norm)
+        cur = [h[0, 1:].float().norm(dim=-1) for h in outs]
         norms = cur if norms is None else [torch.cat([a, b]) for a, b in zip(norms, cur)]
     return [float(n.median()) for n in norms]
 
@@ -81,7 +97,7 @@ def main():
         layer = args.layer if args.layer is not None else int(axes["layer"])
         hint = args.model_hint or axes.get("model_hint", "")
         for k, name in enumerate(axes.get("axis_names", ["valence", "arousal"])):
-            write_cvec(out / f"{name}.gguf", layer, hnorm[layer] * W[k, layer], hint)
+            write_cvec(out / f"{name}.gguf", layer, hnorm[layer] * W[k, layer], hint, hnorm)
         return
 
     if args.test_vectors:
@@ -95,8 +111,8 @@ def main():
         rng = np.random.default_rng(args.seed)
         d = rng.standard_normal(n_embd)
         d /= np.linalg.norm(d)
-        write_cvec(out / "zero.gguf", layer, np.zeros(n_embd), hint)
-        write_cvec(out / "random_d3.gguf", layer, 3.0 * hnorm[layer] * d, hint)
+        write_cvec(out / "zero.gguf", layer, np.zeros(n_embd), hint, hnorm)
+        write_cvec(out / "random_d3.gguf", layer, 3.0 * hnorm[layer] * d, hint, hnorm)
         (out / "hnorm.json").write_text(json.dumps({"layer": layer, "hnorm": hnorm}, indent=1))
         return
 
