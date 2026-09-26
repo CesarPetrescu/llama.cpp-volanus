@@ -236,6 +236,39 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.lora = parse_lora_request(lora);
         }));
 
+    add((new field_json("cvec"))
+        ->set_desc("A list of control vectors to add to this request. Each entry must have `id` (file stem in --cvec-dir) and `scale` fields")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            if (params_base.cvec_dir.empty()) {
+                throw std::runtime_error("control vectors are disabled, start the server with --cvec-dir");
+            }
+            const auto & cvec = data.at("cvec");
+            if (!cvec.is_array()) {
+                throw std::runtime_error("must be an array of objects with 'id' and 'scale' fields");
+            }
+            for (const auto & entry : cvec) {
+                if (!entry.is_object() || !entry.contains("id") || !entry.at("id").is_string() || !entry.contains("scale") || !entry.at("scale").is_number()) {
+                    throw std::runtime_error("each entry must have a string 'id' and a number 'scale'");
+                }
+                const auto   id    = entry.at("id").get<std::string>();
+                const double scale = entry.at("scale").get<double>();
+                if (!std::isfinite(scale) || std::fabs(scale) > params_base.cvec_max_scale) {
+                    throw std::runtime_error(string_format("scale of '%s' must be finite and in [-%g, %g]", id.c_str(), params_base.cvec_max_scale, params_base.cvec_max_scale));
+                }
+                if (ctx.params.cvec.count(id)) {
+                    throw std::runtime_error(string_format("duplicate id '%s'", id.c_str()));
+                }
+                ctx.params.cvec[id] = scale;
+            }
+            // zero scales change nothing, drop them so that equal vectors have equal keys
+            for (auto it = ctx.params.cvec.begin(); it != ctx.params.cvec.end();) {
+                it = it->second == 0.0f ? ctx.params.cvec.erase(it) : std::next(it);
+            }
+        }));
+
+    add((new field_bool("cvec_decode_only", params.cvec_decode_only))
+        ->set_desc("Apply the control vectors only to generated tokens, not to the prompt (default: true). If false, prompt caching is disabled for the request"));
+
     // sequence breakers for DRY
     // Currently, this is not compatible with TextGen WebUI, Koboldcpp and SillyTavern format
     // Ref: https://github.com/oobabooga/text-generation-webui/blob/d1af7a41ade7bd3c3a463bfa640725edb818ebaf/extensions/openai/typing.py#L39
@@ -555,6 +588,11 @@ task_params eval_llama_cmpl_schema(
         // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here
         auto reasoning_format = params.chat_parser_params.reasoning_format;
         params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
+
+        // a steered prompt must not be reused by other requests
+        if (!params.cvec.empty() && !params.cvec_decode_only) {
+            params.cache_prompt = false;
+        }
     }
 
     // debugging

@@ -3796,6 +3796,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cvec-dir"}, "DIR",
+        "load every *.gguf control vector in DIR, requests select them by file stem via the \"cvec\" field",
+        [](common_params & params, const std::string & value) {
+            params.cvec_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cvec-max-scale"}, "X",
+        string_format("max absolute scale of a per-request control vector (default: %.1f)", (double) params.cvec_max_scale),
+        [](common_params & params, const std::string & value) {
+            params.cvec_max_scale = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--lora-init-without-apply"},
         string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
         [](common_params & params) {
