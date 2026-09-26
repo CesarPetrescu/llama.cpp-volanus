@@ -125,6 +125,7 @@ print(r.choices[0].message.content)
 | --- | --- | --- |
 | `--cvec-dir DIR` | unset | load every `*.gguf` in `DIR` as a selectable vector, id = file stem. The server refuses to start if a file's `n_embd` differs from the model's, if a direction is past the last layer, or if the dir has no `.gguf` files |
 | `--cvec-max-scale X` | 3.0 | reject requests with \|scale\| > X |
+| `--cvec-max-total-dose X` | 0 (off) | after summing global and request vectors, rescale each layer whose summed vector is longer than X x that layer's hidden-state norm (`controlvector.hnorm.<il>`, see below). The server refuses to start if a layer used by any loaded vector has no hnorm |
 | `--control-vector`, `--control-vector-scaled`, `--control-vector-layer-range` | stock | still work as a **global baseline** that applies to every request (prompt and generation). The effective vector is always global + request |
 
 ### Request fields
@@ -152,13 +153,17 @@ Errors are HTTP 400 with a message:
 
 ### `GET /cvecs`
 
-Returns `[{"id", "layers", "n_embd"}]`, where `layers` lists the layers that have a non-zero direction.
+Returns `[{"id", "layers", "n_embd", "hnorm"}]`, where `layers` lists the layers that have a non-zero direction, and
+`hnorm` (only when the file has the metadata) holds the hidden-state norm at each of those layers.
 
 ## Making vectors
 
 A control-vector file is a GGUF with one F32 1-D tensor of length `n_embd` per steered layer, named `direction.<il>`
-(`il >= 1`). This is the format `tools/cvector-generator` writes and `common_control_vector_load` reads. Minimal writer
-with the fork's `gguf-py`:
+(`il >= 1`). This is the format `tools/cvector-generator` writes and `common_control_vector_load` reads.
+
+Optional metadata `controlvector.hnorm.<il>` (F32, one key per layer) holds the median norm of the model's hidden state
+at the output of layer `il` (skip token 0, which has outlier norms). `--cvec-max-total-dose` needs it for every layer a
+vector uses. `export_cvec.py` writes it for all layers. Minimal writer with the fork's `gguf-py`:
 
 ```python
 import numpy as np, gguf
@@ -168,6 +173,7 @@ w = gguf.GGUFWriter("vectors/myvec.gguf", "controlvector")
 w.add_string("controlvector.model_hint", "qwen35")
 w.add_int32("controlvector.layer_count", 1)
 w.add_tensor("direction.8", vec)                      # HF layers[8] output == llama.cpp il 8
+w.add_float32("controlvector.hnorm.8", 5.17)          # median ||h|| at layer 8 (repeat per layer)
 w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 ```
 
@@ -179,6 +185,11 @@ python tools/cvec-live/export_cvec.py --axes out/axes.pt --out-dir vectors
 # zero and random test vectors (random = unit vector x 3 x median hidden norm at the middle layer)
 python tools/cvec-live/export_cvec.py --test-vectors --model path/to/hf-model --out-dir vectors-test
 ```
+
+**Dose cap.** With `--cvec-max-total-dose X`, the server sums the global vector and every request vector, then for each
+layer rescales the sum to `X x hnorm[il]` if it is longer. A request that combines several vectors, each within
+`--cvec-max-scale`, thus still cannot push the residual stream further than `X` hidden-state norms. The rescale keeps
+the direction of the sum.
 
 **Scale units.** The server adds `scale x direction` as-is. `export_cvec.py` bakes `median ||h|| at layer L` into the
 direction, so `scale` becomes a relative dose: 1.0 adds a vector as long as a typical hidden state. On Qwen3.5-2B, with

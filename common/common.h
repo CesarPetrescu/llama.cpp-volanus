@@ -697,6 +697,7 @@ struct common_params {
 
     std::string cvec_dir;          // directory of control vectors that requests can select by id
     float       cvec_max_scale = 3.0f;
+    float       cvec_max_total_dose = 0.0f; // max ||sum of vectors|| / hnorm per layer, 0 = off
 
     // batched-bench params
     bool is_pp_shared   = false;
