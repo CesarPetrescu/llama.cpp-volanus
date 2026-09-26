@@ -39,6 +39,11 @@ json task_params::to_json(bool only_metrics) const {
         lora.push_back({{"id", it.first}, {"scale", it.second}});
     }
 
+    json cvec = json::array();
+    for (auto & it : this->cvec) {
+        cvec.push_back({{"id", it.first}, {"scale", it.second}});
+    }
+
     if (only_metrics) {
         return json {
             {"seed",                      sampling.seed},
@@ -83,6 +88,8 @@ json task_params::to_json(bool only_metrics) const {
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
+            {"cvec",                      cvec},
+            {"cvec_decode_only",          cvec_decode_only},
         };
     }
 
@@ -142,6 +149,8 @@ json task_params::to_json(bool only_metrics) const {
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
+        {"cvec",                      cvec},
+        {"cvec_decode_only",          cvec_decode_only},
     };
 }
 

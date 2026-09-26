@@ -695,6 +695,9 @@ struct common_params {
 
     float slot_prompt_similarity = 0.1f;
 
+    std::string cvec_dir;          // directory of control vectors that requests can select by id
+    float       cvec_max_scale = 3.0f;
+
     // batched-bench params
     bool is_pp_shared   = false;
     bool is_tg_separate = false;

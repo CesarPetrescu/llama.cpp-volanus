@@ -69,6 +69,9 @@ struct task_params {
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
+    std::map<std::string, float> cvec; // mapping control vector ID -> scale
+    bool cvec_decode_only = true;      // do not steer the prompt
+
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 

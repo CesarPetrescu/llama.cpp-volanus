@@ -446,12 +446,20 @@ struct server_slot {
             (llama_get_memory(ctx_tgt) && llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_LAST);
     }
 
+    // control vectors for the next decode, a decode-only task has none while it processes the prompt
+    const std::map<std::string, float> & cvec_active() const {
+        static const std::map<std::string, float> none;
+        GGML_ASSERT(task);
+        return task->params.cvec_decode_only && state != SLOT_STATE_GENERATING ? none : task->params.cvec;
+    }
+
     bool can_batch_with(server_slot & other_slot) const {
         GGML_ASSERT(task);
 
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
-            && are_lora_equal(lora, other_slot.lora);
+            && are_lora_equal(lora, other_slot.lora)
+            && cvec_active() == other_slot.cvec_active();
     }
 
     // returns -1 if the generation is limitless
@@ -553,6 +561,11 @@ struct server_slot {
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
+                prompt_clear();
+            }
+
+            // the prompt was steered, do not reuse it for other requests
+            if (!task->params.cvec.empty() && !task->params.cvec_decode_only) {
                 prompt_clear();
             }
 
@@ -850,6 +863,15 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
+    // control vectors from --cvec-dir, by file stem
+    // note: only written by the first load_model(), read-only after that
+    struct server_cvec {
+        int n_embd;
+        std::vector<float> data; // n_embd x n_layer, layer 1 at [0]
+        std::vector<int>   layers;
+    };
+    std::map<std::string, server_cvec> cvecs;
+
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
     server_context_impl() {
@@ -894,6 +916,10 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    std::vector<float> cvec_base; // global --control-vector data, zero outside its layer range
+    std::vector<float> cvec_buf;
+    std::map<std::string, float> cvec_applied; // request vectors currently set on ctx_tgt
 
     bool add_bos_token = true;
 
@@ -1116,6 +1142,10 @@ private:
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        if (!load_cvecs()) {
+            return false;
+        }
 
         if (has_spec) {
             // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
@@ -1691,6 +1721,105 @@ private:
         return res;
     }
 
+    bool load_cvecs() {
+        // a new context has only the global vector set
+        cvec_applied.clear();
+
+        if (params_base.cvec_dir.empty() || !cvecs.empty()) {
+            return true;
+        }
+
+        const int n_embd  = llama_model_n_embd(model_tgt);
+        const int n_layer = llama_model_n_layer(model_tgt);
+
+        std::error_code ec;
+        for (const auto & entry : std::filesystem::directory_iterator(params_base.cvec_dir, ec)) {
+            if (entry.path().extension() != ".gguf") {
+                continue;
+            }
+            const std::string fname = entry.path().string();
+            const auto cvec = common_control_vector_load({ { 1.0f, fname } });
+            if (cvec.n_embd != n_embd) {
+                SRV_ERR("control vector '%s' has n_embd = %d, model has n_embd = %d\n", fname.c_str(), cvec.n_embd, n_embd);
+                return false;
+            }
+            if (cvec.data.size() / n_embd >= (size_t) n_layer) {
+                SRV_ERR("control vector '%s' has directions past the last layer (%d)\n", fname.c_str(), n_layer - 1);
+                return false;
+            }
+
+            server_cvec cur;
+            cur.n_embd = n_embd;
+            cur.data   = cvec.data;
+            cur.data.resize((size_t) n_embd * n_layer, 0.0f);
+            for (int il = 1; il < n_layer; il++) {
+                const auto it = cur.data.begin() + (size_t) n_embd * (il - 1);
+                if (std::any_of(it, it + n_embd, [](float x) { return x != 0.0f; })) {
+                    cur.layers.push_back(il);
+                }
+            }
+            cvecs[entry.path().stem().string()] = std::move(cur);
+        }
+        if (ec) {
+            SRV_ERR("failed to read --cvec-dir '%s': %s\n", params_base.cvec_dir.c_str(), ec.message().c_str());
+            return false;
+        }
+        if (cvecs.empty()) {
+            SRV_ERR("no *.gguf control vectors in '%s'\n", params_base.cvec_dir.c_str());
+            return false;
+        }
+
+        cvec_base.assign((size_t) n_embd * n_layer, 0.0f);
+        if (!params_base.control_vectors.empty()) {
+            const auto base = common_control_vector_load(params_base.control_vectors);
+            for (int il = std::max(1, params_base.control_vector_layer_start); il <= params_base.control_vector_layer_end && il < n_layer; il++) {
+                const size_t off = (size_t) n_embd * (il - 1);
+                if (off + n_embd <= base.data.size()) {
+                    std::copy_n(base.data.begin() + off, n_embd, cvec_base.begin() + off);
+                }
+            }
+        }
+
+        SRV_INF("loaded %zu control vectors from '%s'\n", cvecs.size(), params_base.cvec_dir.c_str());
+
+        return true;
+    }
+
+    // set global + request control vectors on ctx_tgt, only if they differ from the current ones
+    bool apply_cvec(const std::map<std::string, float> & cvec) {
+        if (cvec == cvec_applied) {
+            return true;
+        }
+
+        const int n_embd  = llama_model_n_embd(model_tgt);
+        const int n_layer = llama_model_n_layer(model_tgt);
+
+        std::string desc;
+        int32_t err = 0;
+        if (cvec.empty() && params_base.control_vectors.empty()) {
+            err = llama_set_adapter_cvec(ctx_tgt, nullptr, 0, n_embd, -1, -1);
+        } else {
+            cvec_buf = cvec_base;
+            for (const auto & [id, scale] : cvec) {
+                const auto & cur = cvecs.at(id);
+                for (size_t i = 0; i < cvec_buf.size(); i++) {
+                    cvec_buf[i] += scale * cur.data[i];
+                }
+                desc += string_format("%s%s x %.3f (layers %s)", desc.empty() ? "" : ", ", id.c_str(), scale, string_from(cur.layers).c_str());
+            }
+            err = llama_set_adapter_cvec(ctx_tgt, cvec_buf.data(), cvec_buf.size(), n_embd, 1, n_layer);
+        }
+        if (err) {
+            SRV_ERR("failed to apply control vector, err = %d\n", err);
+            return false;
+        }
+
+        SRV_DBG("applied control vector: %s%s\n", desc.empty() ? "none" : desc.c_str(), params_base.control_vectors.empty() ? "" : " + global");
+        cvec_applied = cvec;
+
+        return true;
+    }
+
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
         std::vector<common_adapter_lora_info> output = params_base.lora_adapters; // copy
         for (size_t i = 0; i < output.size(); ++i) {
@@ -1705,6 +1834,13 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        for (const auto & [id, scale] : task.params.cvec) {
+            if (!cvecs.count(id)) {
+                send_error(task, string_format("unknown control vector id '%s'", id.c_str()), ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2853,6 +2989,11 @@ private:
             // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
             // apply lora, only need to do it once per batch
             common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+
+            if (!apply_cvec(slot_batched->cvec_active())) {
+                abort_all_slots("failed to apply control vector");
+                return;
+            }
 
             // if the lora is temporarily disabled for an alora, re-enable it
             // for next time
@@ -5249,6 +5390,20 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_get_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_cvecs = [this](const server_http_req &) {
+        auto res = create_response();
+        json result = json::array();
+        for (const auto & [id, cvec] : ctx_server.cvecs) {
+            result.push_back({
+                {"id",     id},
+                {"layers", cvec.layers},
+                {"n_embd", cvec.n_embd},
+            });
+        }
+        res->ok(result);
         return res;
     };
 
